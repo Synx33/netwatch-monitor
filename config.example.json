@@ -1,0 +1,77 @@
+{
+  "telegram": {
+    "bot_token": "123456789:YOUR_TELEGRAM_BOT_TOKEN",
+    "chat_id": "YOUR_ADMIN_CHAT_ID"
+  },
+
+  "check_interval": 30,
+  "alert_cooldown": 300,
+  "offline_threshold": 30,
+  "power_outage_delay": 420,
+
+  "flap_window": 1800,
+  "flap_threshold": 5,
+  "flap_suppress": 3600,
+
+  "clock_fix_enabled": false,
+
+  "sites": [
+    {
+      "name": "Site A",
+      "telegram_chat_id": "CLIENT_GROUP_CHAT_ID_OR_EMPTY",
+      "notifications": {
+        "offline": true,
+        "reboot": true,
+        "power_outage": true,
+        "hdd": true,
+        "camera": true,
+        "recording": true,
+        "clock": true
+      },
+      "devices": [
+        {
+          "name": "NVR 1",
+          "type": "hikvision_nvr",
+          "ip": "192.0.2.10",
+          "port": 80,
+          "username": "admin",
+          "password": "CHANGE_ME"
+        },
+        {
+          "name": "Gateway Router",
+          "type": "router",
+          "ip": "192.0.2.1",
+          "port": 80,
+          "username": "admin",
+          "password": "CHANGE_ME"
+        }
+      ]
+    },
+    {
+      "name": "Site B",
+      "telegram_chat_id": "",
+      "devices": [
+        {
+          "name": "NVR 1",
+          "type": "auto_nvr",
+          "ip": "203.0.113.10",
+          "port": 81,
+          "username": "admin",
+          "password": "CHANGE_ME"
+        },
+        {
+          "name": "Core Switch",
+          "type": "snmp",
+          "ip": "203.0.113.2",
+          "snmp_community": "public"
+        },
+        {
+          "name": "UPS",
+          "type": "ups",
+          "ip": "203.0.113.3",
+          "snmp_community": "public"
+        }
+      ]
+    }
+  ]
+}

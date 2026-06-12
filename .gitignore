@@ -1,0 +1,40 @@
+# ── Secrets & runtime data — NEVER commit ──────────────────────────────
+config.json
+*.json.bak
+*.json.bak.*
+vpn_sites.json
+notes.json
+admins.json
+auth_breaker.json
+scan_history.json
+sessions.json
+state.json
+clock_fix_state.json
+clock_fix_audit.jsonl
+
+# Logs / captured data
+*.log
+syslog.jsonl
+syslog.jsonl.*
+syslog/
+outages.jsonl
+
+# Large generated / third-party data
+mac_vendors.json
+oui.csv
+
+# Build artifacts
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.egg-info/
+venv/
+.venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
