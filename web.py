@@ -23,6 +23,11 @@ STATE_PATH = Path(__file__).parent / 'state.json'
 NOTES_PATH = Path(__file__).parent / 'notes.json'
 PORT = 7700
 
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import license_service
+from requests.auth import HTTPBasicAuth
+
 # Auth
 AUTH_USER = os.environ.get("NETWATCH_USER", "admin")
 AUTH_PASS = os.environ.get("NETWATCH_PASS", "change-me")  # set via env var; never hardcode
@@ -449,6 +454,97 @@ def load_state():
             return json.load(f)
     except:
         return {}
+
+
+# ── Haven PMS fleet ──────────────────────────────────────────────────────────
+def _latest_haven_snapshot(state, site_name, ip):
+    for s in reversed(state.get('sites', {}).get(site_name, []) or []):
+        if s.get('ip') == ip and s.get('type') == 'haven_pms':
+            return s
+    return None
+
+
+def find_haven_device(site_id=None, ip=None, port=None):
+    """Locate a haven_pms device config (with creds) by site_id or ip[:port]."""
+    for site in load_config().get('sites', []):
+        for dev in site.get('devices', []):
+            if dev.get('type') != 'haven_pms':
+                continue
+            if site_id and dev.get('site_id') == site_id:
+                return site.get('name'), dev
+            if ip and dev.get('ip') == ip and (port is None or int(dev.get('port', 8770)) == int(port)):
+                return site.get('name'), dev
+    return None, None
+
+
+def build_fleet(live_poll=True):
+    """One row per Haven site for the fleet view. Prefers the last snapshot the
+    monitor loop wrote to state.json; falls back to a single live poll so the
+    page is useful even before the loop has run."""
+    cfg = load_config()
+    state = load_state()
+    rows = []
+    for site in cfg.get('sites', []):
+        sname = site.get('name')
+        for dev in site.get('devices', []):
+            if dev.get('type') != 'haven_pms':
+                continue
+            snap = _latest_haven_snapshot(state, sname, dev.get('ip'))
+            if (snap is None or not snap.get('haven')) and live_poll:
+                try:
+                    from devices import create_monitor
+                    snap = create_monitor(dict(dev, name=dev.get('name'))).get_status()
+                except Exception as e:
+                    snap = {'online': None, 'reachable': False, 'haven': None, 'poll_error': str(e)[:120]}
+            snap = snap or {}
+            h = snap.get('haven') or {}
+            site_id = dev.get('site_id') or ''
+            rows.append({
+                'site': sname, 'device': dev.get('name'), 'ip': dev.get('ip'),
+                'port': dev.get('port', 8770), 'site_id': site_id,
+                'online': snap.get('online'), 'reachable': snap.get('reachable'),
+                'timestamp': snap.get('timestamp'),
+                'app_version': h.get('app_version'),
+                'property_name': h.get('property_name'),
+                'business_date': h.get('business_date'),
+                'hours_since_night_audit': h.get('hours_since_night_audit'),
+                'night_audit_blocked': h.get('night_audit_blocked'),
+                'occupancy_pct': h.get('occupancy_pct'),
+                'rooms_total': h.get('rooms_total'),
+                'rooms_sold_tonight': h.get('rooms_sold_tonight'),
+                'in_house': h.get('in_house'),
+                'last_backup_at': h.get('last_backup_at'),
+                'last_backup_ok': h.get('last_backup_ok'),
+                'disk_free_bytes': h.get('disk_free_bytes'),
+                'integrity_ok': h.get('integrity_ok'),
+                'license_days_left': h.get('license_days_left'),
+                'license_source': h.get('license_source'),
+                'lock_driver': h.get('lock_driver'),
+                'encoder_present': h.get('encoder_present'),
+                'errors': h.get('errors') or [],
+                'nw_license': license_service.license_summary(site_id) if site_id else {'licensed': False, 'days_left': None},
+            })
+    return {'fleet': rows}
+
+
+def proxy_haven_command(dev, action, params=None, force=False):
+    """Forward a whitelisted command to a Haven site's /api/monitor/command."""
+    import uuid
+    from datetime import datetime as _dt, timezone as _tz
+    url = f"http://{dev['ip']}:{int(dev.get('port', 8770))}/api/monitor/command"
+    payload = {'id': str(uuid.uuid4()), 'action': action,
+               'issued_at': _dt.now(_tz.utc).isoformat(),
+               'params': params or {}, 'force': bool(force)}
+    try:
+        r = requests.post(url, json=payload,
+                          auth=HTTPBasicAuth(dev.get('username', 'netwatch'), dev.get('password', '')),
+                          timeout=180)
+        try:
+            return r.status_code, r.json()
+        except Exception:
+            return r.status_code, {'ok': False, 'error': 'non-JSON response'}
+    except Exception as e:
+        return 0, {'ok': False, 'error': f'unreachable: {type(e).__name__}'}
 
 
 def test_device(ip, port, username, password, device_type, snmp_community='public'):
@@ -2438,6 +2534,237 @@ PAGE_HTML = """<!DOCTYPE html>
 </html>"""
 
 
+FLEET_HTML = """<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Haven Fleet — NetWatch</title>
+<style>
+  :root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e7eaf0;--dim:#93a0b4;
+        --ok:#37c26b;--warn:#e5a52c;--crit:#e5484d;--accent:#5b8cff}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:12px 16px;
+         border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5}
+  header h1{font-size:16px;margin:0}
+  header a{color:var(--accent);text-decoration:none;font-size:13px}
+  .wrap{padding:14px 16px;max-width:1200px;margin:0 auto}
+  h2{font-size:14px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin:22px 0 10px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+  .site-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+  .site-name{font-size:16px;font-weight:650}
+  .site-sub{color:var(--dim);font-size:12px}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:12px}
+  .metric{background:#12151b;border:1px solid var(--line);border-radius:9px;padding:8px 10px}
+  .metric .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  .metric .v{font-size:16px;font-weight:600;margin-top:2px}
+  .v.ok{color:var(--ok)} .v.warn{color:var(--warn)} .v.crit{color:var(--crit)}
+  .btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+  button{background:#212633;color:var(--fg);border:1px solid var(--line);border-radius:8px;
+         padding:7px 11px;font-size:13px;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.danger{border-color:#5a2b2f}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#08122b;font-weight:600}
+  .out{margin-top:10px;font-size:12px;color:var(--dim);white-space:pre-wrap;
+       background:#0c0e12;border:1px solid var(--line);border-radius:8px;padding:8px;display:none}
+  table.lic{width:100%;border-collapse:collapse;font-size:13px}
+  table.lic th,table.lic td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line)}
+  table.lic th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase}
+  form.lic{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:12px}
+  form.lic label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+  form.lic input,form.lic select{background:#0c0e12;border:1px solid var(--line);border-radius:7px;
+         color:var(--fg);padding:7px 8px;font-size:13px}
+  .mods{display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+  .mods label{flex-direction:row;align-items:center;gap:6px;color:var(--fg)}
+  .muted{color:var(--dim);font-size:12px}
+  @media(max-width:560px){.grid{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>🏨 Haven Fleet</h1>
+  <a href="/">← NetWatch</a>
+  <span style="flex:1"></span>
+  <button onclick="loadFleet()">↻ Refresh</button>
+</header>
+<div class="wrap">
+  <h2>Sites</h2>
+  <div id="fleet"><p class="muted">Loading…</p></div>
+
+  <h2>Licences</h2>
+  <div class="card">
+    <table class="lic"><thead><tr><th>Site ID</th><th>Property</th><th>Expires</th><th>Days left</th><th>Modules</th><th></th></tr></thead>
+    <tbody id="licrows"></tbody></table>
+    <div class="btns"><button class="primary" onclick="editLicense('')">+ New / edit licence</button></div>
+    <div id="licform"></div>
+  </div>
+</div>
+<script>
+const MODULES = ["locks","channel","inventory","tablet"];
+function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function fmtBytes(n){if(n==null)return '—';const u=['B','KB','MB','GB','TB'];let i=0;n=+n;while(n>=1024&&i<4){n/=1024;i++;}return n.toFixed(1)+' '+u[i];}
+function ageH(iso){if(!iso)return null;return (Date.now()-new Date(iso).getTime())/3600000;}
+
+async function loadFleet(){
+  const r = await fetch('/api/fleet'); const d = await r.json();
+  const el = document.getElementById('fleet');
+  if(!d.fleet || !d.fleet.length){el.innerHTML='<p class="muted">No Haven sites in config. Add a device of type <b>haven_pms</b>.</p>';return;}
+  el.innerHTML = d.fleet.map(renderSite).join('');
+}
+function cls(cond_ok,cond_warn){return cond_ok?'ok':(cond_warn?'warn':'crit');}
+function renderSite(s){
+  const online = s.reachable ? 'var(--ok)' : (s.online ? 'var(--warn)' : 'var(--crit)');
+  const na = s.hours_since_night_audit;
+  const naCls = na==null?'':(na>26?'crit':(s.night_audit_blocked?'warn':'ok'));
+  const bAge = ageH(s.last_backup_at);
+  const bCls = (s.last_backup_ok===false||bAge==null||bAge>26)?'crit':'ok';
+  const dl = s.license_days_left;
+  const dCls = dl==null?'':(dl<0?'crit':(dl<10?'warn':'ok'));
+  const disk = s.disk_free_bytes;
+  const diskCls = disk==null?'':(disk<500*1024*1024?'crit':(disk<2*1024**3?'warn':'ok'));
+  const m = (k,v,c)=>`<div class="metric"><div class="k">${k}</div><div class="v ${c||''}">${v}</div></div>`;
+  const sid = esc(s.site_id||'');
+  return `<div class="card">
+    <div class="site-head">
+      <div><span class="dot" style="background:${online}"></span>
+        <span class="site-name">${esc(s.property_name||s.device||s.site||'(unlicensed)')}</span>
+        <span class="site-sub"> — ${esc(s.site||'')} · ${esc(s.ip)}:${s.port} · site_id: ${sid||'—'}</span></div>
+      <span class="site-sub">${s.reachable?'online':(s.online?'API down':'offline')}${s.timestamp?' · '+esc(s.timestamp.slice(11,19)):''}</span>
+    </div>
+    <div class="grid">
+      ${m('Version', esc(s.app_version||'—'))}
+      ${m('Business date', esc(s.business_date||'—'))}
+      ${m('Night audit', na==null?'—':(na.toFixed(0)+'h'+(s.night_audit_blocked?' ⚠':'')), naCls)}
+      ${m('Occupancy', s.occupancy_pct==null?'—':(s.occupancy_pct+'%'))}
+      ${m('Rooms sold', (s.rooms_sold_tonight==null?'—':s.rooms_sold_tonight)+' / '+(s.rooms_total==null?'—':s.rooms_total))}
+      ${m('Backup age', bAge==null?'—':(bAge.toFixed(1)+'h'), bCls)}
+      ${m('Disk free', fmtBytes(disk), diskCls)}
+      ${m('Licence', dl==null?(esc(s.license_source||'none')):(dl+'d'), dCls)}
+    </div>
+    <div class="btns">
+      <button onclick="cmd(this,'${sid}','run_backup')">Backup</button>
+      <button onclick="cmd(this,'${sid}','verify_backup')">Verify backup</button>
+      <button onclick="cmd(this,'${sid}','integrity_check')">Integrity</button>
+      <button onclick="cmd(this,'${sid}','collect_diagnostics')">Diagnostics</button>
+      <button onclick="cmd(this,'${sid}','refresh_license')">Refresh licence</button>
+      <button class="danger" onclick="cmdRestart(this,'${sid}','${esc(s.property_name||s.site)}')">Restart</button>
+      <button class="danger" onclick="cmdUpgrade(this,'${sid}','${esc(s.property_name||s.site)}','${esc(s.app_version||'')}')">Upgrade…</button>
+    </div>
+    <div class="out"></div>
+  </div>`;
+}
+async function postCmd(sid, action, params, force){
+  const r = await fetch('/api/fleet/command',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({site_id:sid,action:action,params:params||{},force:!!force})});
+  return await r.json();
+}
+async function cmd(btn, sid, action){
+  const out = btn.closest('.card').querySelector('.out');
+  out.style.display='block'; out.textContent='Running '+action+'…';
+  const d = await postCmd(sid, action);
+  out.textContent = (d.ok?'✅ ':'❌ ')+action+' → '+JSON.stringify(d.result||d, null, 2);
+}
+function cmdRestart(btn, sid, name){
+  if(!confirm('Restart Haven at "'+name+'"? Active sessions drop briefly.'))return;
+  cmd(btn, sid, 'restart');
+}
+async function cmdUpgrade(btn, sid, name, cur){
+  const ver = prompt('Upgrade "'+name+'" (current '+(cur||'?')+') — target VERSION:');
+  if(!ver)return;
+  const url = prompt('Signed bundle URL for '+name+' v'+ver+':');
+  if(!url)return;
+  if(!confirm('CONFIRM UPGRADE\\nProperty: '+name+'\\nTarget version: '+ver+'\\nBundle: '+url+'\\n\\nProceed?'))return;
+  const out = btn.closest('.card').querySelector('.out');
+  out.style.display='block'; out.textContent='Upgrading '+name+' → '+ver+'…';
+  const d = await postCmd(sid, 'upgrade', {version:ver, url:url}, true);
+  out.textContent = (d.ok?'✅ ':'❌ ')+'upgrade → '+JSON.stringify(d.result||d, null, 2);
+}
+
+// ── licences ──
+let LIC = {};
+async function loadLicenses(){
+  const r = await fetch('/api/licenses'); const d = await r.json();
+  LIC = d.licenses||{};
+  const tb = document.getElementById('licrows');
+  const keys = Object.keys(LIC);
+  tb.innerHTML = keys.length? keys.map(sid=>{
+    const l=LIC[sid];
+    return `<tr><td><b>${esc(sid)}</b></td><td>${esc(l.property_name||'')}</td>
+      <td>${esc((l.expires_at||'').slice(0,10)||'+1y')}</td>
+      <td>${l.days_left==null?'—':l.days_left}</td>
+      <td>${esc((l.modules_enabled||[]).join(', '))}</td>
+      <td><button onclick="editLicense('${esc(sid)}')">Edit</button>
+          <button class="danger" onclick="delLicense('${esc(sid)}')">Delete</button></td></tr>`;
+  }).join('') : '<tr><td colspan=6 class="muted">No licences issued yet.</td></tr>';
+}
+function field(name,label,val,type){return `<label>${label}<input name="${name}" type="${type||'text'}" value="${esc(val==null?'':val)}"></label>`;}
+function editLicense(sid){
+  const l = LIC[sid]||{};
+  const lc = l.lock_config||{};
+  const mods = l.modules_enabled||[];
+  document.getElementById('licform').innerHTML = `
+    <h2 style="margin-top:18px">${sid?('Edit '+esc(sid)):'New licence'}</h2>
+    <form class="lic" onsubmit="return saveLicense(event)">
+      ${field('site_id','Site ID (matches HAVEN_SITE_ID)', sid)}
+      ${field('property_name','Property name', l.property_name)}
+      ${field('city','City', l.city)}
+      ${field('address','Address', l.address)}
+      ${field('phone','Phone', l.phone)}
+      ${field('tax_id','Tax ID', l.tax_id)}
+      ${field('currency','Currency', l.currency||'GEL')}
+      ${field('currency_symbol','Symbol', l.currency_symbol||'₾')}
+      ${field('vat_rate','VAT %', l.vat_rate==null?18:l.vat_rate,'number')}
+      ${field('max_rooms','Max rooms', l.max_rooms==null?0:l.max_rooms,'number')}
+      ${field('expires_at','Expires (YYYY-MM-DD, blank=+1y)', (l.expires_at||'').slice(0,10))}
+      ${field('grace_days','Grace days', l.grace_days==null?30:l.grace_days,'number')}
+      <label style="grid-column:1/-1">Modules
+        <div class="mods">${MODULES.map(mm=>`<label><input type="checkbox" name="mod_${mm}" ${mods.includes(mm)?'checked':''}>${mm}</label>`).join('')}</div></label>
+      <label>Lock driver
+        <select name="lc_driver">${['manual','prousb','bonwin'].map(x=>`<option ${(lc.driver||'manual')===x?'selected':''}>${x}</option>`).join('')}</select></label>
+      ${field('lc_prousb_dlscoid','proUSB dlsCoID', lc.prousb_dlscoid)}
+      ${field('lc_prousb_lockno_format','proUSB LockNo format', lc.prousb_lockno_format||'{bld:02d}{flr:02d}{rom:02d}')}
+      ${field('lc_bonwin_version','Bonwin version', lc.bonwin_version||'808')}
+      ${field('lc_bonwin_hotelpw','Bonwin hotel PW', lc.bonwin_hotelpw)}
+      ${field('lc_bonwin_oldpw','Bonwin old PW', lc.bonwin_oldpw)}
+      <div class="btns" style="grid-column:1/-1"><button class="primary" type="submit">Save & sign</button>
+        <button type="button" onclick="document.getElementById('licform').innerHTML=''">Cancel</button></div>
+    </form>
+    <p class="muted">Saving signs the record with the operator key on this server and makes it fetchable at <code>/api/v1/license/&lt;site_id&gt;</code>.</p>`;
+}
+async function saveLicense(ev){
+  ev.preventDefault();
+  const f = ev.target; const g = n=>f.elements[n]? f.elements[n].value : '';
+  const sid = g('site_id').trim();
+  if(!sid){alert('Site ID required');return false;}
+  const body = {property_name:g('property_name'),city:g('city'),address:g('address'),
+    phone:g('phone'),tax_id:g('tax_id'),currency:g('currency'),currency_symbol:g('currency_symbol'),
+    vat_rate:g('vat_rate'),max_rooms:g('max_rooms'),expires_at:g('expires_at'),grace_days:g('grace_days'),
+    modules_enabled: MODULES.filter(mm=>f.elements['mod_'+mm] && f.elements['mod_'+mm].checked),
+    lock_config:{driver:g('lc_driver'),prousb_dlscoid:g('lc_prousb_dlscoid'),
+      prousb_lockno_format:g('lc_prousb_lockno_format'),bonwin_version:g('lc_bonwin_version'),
+      bonwin_hotelpw:g('lc_bonwin_hotelpw'),bonwin_oldpw:g('lc_bonwin_oldpw')}};
+  const r = await fetch('/api/licenses/'+encodeURIComponent(sid),{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const d = await r.json();
+  if(d.ok){document.getElementById('licform').innerHTML='<p class="muted">✅ Saved & signed '+esc(sid)+'.</p>';loadLicenses();loadFleet();}
+  else alert('Save failed: '+(d.error||'?'));
+  return false;
+}
+async function delLicense(sid){
+  if(!confirm('Delete licence for '+sid+'? The site will become unlicensed on its next refresh.'))return;
+  await fetch('/api/licenses/'+encodeURIComponent(sid),{method:'DELETE'});
+  loadLicenses(); loadFleet();
+}
+loadFleet(); loadLicenses();
+setInterval(loadFleet, 30000);
+</script>
+</body>
+</html>"""
+
+
 class NetWatchWebHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
@@ -2449,9 +2776,41 @@ class NetWatchWebHandler(BaseHTTPRequestHandler):
             self.send_html(PAGE_HTML)
             return
 
+        if path == '/fleet':
+            if not check_auth(self):
+                self.send_html(LOGIN_HTML)
+                return
+            self.send_html(FLEET_HTML)
+            return
+
+        # Machine endpoint: a Haven install fetches its signed licence with no
+        # dashboard session (it authenticates by verifying the Ed25519 signature,
+        # not by logging in). Signed → tamper-proof even without transport auth.
+        if path.startswith('/api/v1/license/'):
+            site_id = path[len('/api/v1/license/'):]
+            rec = license_service.signed_license(site_id)
+            if rec is None:
+                self.send_response(404)
+                self.send_header('Content-Type', 'application/json')
+                self._security_headers()
+                self.end_headers()
+                self.wfile.write(b'{"error":"no licence for this site"}')
+                return
+            self.send_json(rec)
+            return
+
         # All API endpoints require auth
         if path.startswith('/api/') and path != '/api/login' and not check_auth(self):
             self.send_json({'error': 'unauthorized'})
+            return
+
+        if path == '/api/fleet':
+            self.send_json(build_fleet())
+            return
+        if path == '/api/licenses':
+            self.send_json({'licenses': license_service.list_licenses(),
+                            'modules': license_service.MODULES,
+                            'defaults': license_service.DEFAULTS})
             return
 
         if path == '/api/status':
@@ -2749,6 +3108,36 @@ class NetWatchWebHandler(BaseHTTPRequestHandler):
             self.send_json({'error': 'unauthorized'})
             return
 
+        if path.startswith('/api/licenses/'):
+            site_id = path[len('/api/licenses/'):]
+            if not site_id:
+                self.send_json({'ok': False, 'error': 'missing site_id'})
+                return
+            try:
+                rec = license_service.upsert_license(site_id, body if isinstance(body, dict) else {})
+                self.send_json({'ok': True, 'site_id': site_id, 'license': rec})
+            except Exception as e:
+                self.send_json({'ok': False, 'error': str(e)[:200]})
+            return
+
+        elif path == '/api/fleet/command':
+            action = (body or {}).get('action')
+            allowed = {'run_backup', 'verify_backup', 'integrity_check',
+                       'collect_diagnostics', 'refresh_license', 'restart', 'upgrade'}
+            if action not in allowed:
+                self.send_json({'ok': False, 'error': f'action {action!r} not offered from fleet view'})
+                return
+            _, dev = find_haven_device(site_id=(body or {}).get('site_id'),
+                                       ip=(body or {}).get('ip'), port=(body or {}).get('port'))
+            if not dev:
+                self.send_json({'ok': False, 'error': 'no matching Haven device in config'})
+                return
+            code, result = proxy_haven_command(dev, action, (body or {}).get('params'),
+                                               (body or {}).get('force'))
+            self.send_json({'ok': code == 200 and bool(result.get('ok')),
+                            'http_status': code, 'result': result})
+            return
+
         if path.startswith('/api/notes/'):
             from urllib.parse import unquote
             site_name = unquote(path.split('/api/notes/', 1)[1])
@@ -2956,6 +3345,11 @@ class NetWatchWebHandler(BaseHTTPRequestHandler):
             name = unquote(path.split('/api/vpn/', 1)[1])
             ok, error = remove_site(name)
             self.send_json({'ok': ok, 'error': error})
+            return
+
+        if path.startswith('/api/licenses/'):
+            site_id = path[len('/api/licenses/'):]
+            self.send_json({'ok': license_service.delete_license(site_id)})
             return
 
         parts = path.split('/')

@@ -1,5 +1,7 @@
 # ── Secrets & runtime data — NEVER commit ──────────────────────────────
 config.json
+licenses.json
+licenses.json.tmp
 *.json.bak
 *.json.bak.*
 vpn_sites.json

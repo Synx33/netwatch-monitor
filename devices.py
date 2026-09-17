@@ -9,7 +9,7 @@ import json
 import time
 import requests
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from requests.auth import HTTPDigestAuth, HTTPBasicAuth
 
 
@@ -1349,6 +1349,197 @@ class HTTPDevice(BaseDevice):
 
 
 # ============================================================
+# HAVEN PMS (hotel property-management system, our own product)
+# ============================================================
+def _hours_since(iso):
+    """Hours since an ISO-8601 timestamp, or None if unparseable/empty."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
+def _fmt_bytes(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return '?'
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024 or unit == 'TB':
+            return f"{n:.1f} {unit}" if unit != 'B' else f"{int(n)} B"
+        n /= 1024
+
+
+class HavenPMS(HTTPAPIDevice):
+    """Haven PMS reception server, polled over the site tunnel with
+    GET /api/monitor/status (HTTP Basic). Contract: docs/NETWATCH_INTEGRATION.md
+    in the Haven repo. This class only REPORTS state and raises alerts — all
+    spam control, flap suppression and cooldown belong to AlertManager, exactly
+    as for the NVR classes."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        # Haven listens on 8770 by default; keep uid/base_url consistent with it
+        self.port = config.get('port', 8770)
+        self.uid = f"{self.ip}:{self.port}"
+        self.base_url = f"http://{self.ip}:{self.port}"
+        mon = config.get('monitor', {}) or {}
+        self.fleet_target_version = (config.get('fleet_target_version')
+                                     or mon.get('fleet_target_version'))
+
+    def _fetch(self):
+        resp = self._get_basic('/api/monitor/status')
+        if not resp:
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            return None
+
+    def get_status(self):
+        status = {
+            'name': self.name, 'ip': self.ip, 'port': self.port,
+            'type': 'haven_pms', 'online': self._ping(),
+            'timestamp': datetime.now().isoformat(),
+            'reachable': False, 'haven': None,
+        }
+        if not status['online']:
+            return status
+        data = self._fetch()
+        if data is None:
+            return status                       # host up, API not answering
+        status['reachable'] = True
+        status['haven'] = data
+        # hoist headline fields so the fleet table can read them flat
+        for k in ('app_version', 'property_name', 'site_id', 'business_date',
+                  'hours_since_night_audit', 'night_audit_blocked',
+                  'occupancy_pct', 'rooms_total', 'rooms_sold_tonight', 'in_house',
+                  'last_backup_at', 'last_backup_ok', 'disk_free_bytes',
+                  'integrity_ok', 'license_days_left', 'license_source',
+                  'lock_driver', 'encoder_present'):
+            status[k] = data.get(k)
+        return status
+
+    def check_all(self, alert_mgr):
+        alerts, is_online = self._offline_alerts(alert_mgr)
+        if not is_online:
+            return alerts
+
+        status = self.get_status()
+        data = status.get('haven')
+        uid = self.uid
+        nm = self.name
+
+        # PMS service reachable? (host pings but API silent → one warning)
+        if not data:
+            alerts.append({'key': f"{uid}_pmsapi", 'severity': 'warning', 'category': 'pms_error',
+                'message': (f"🟠 <b>{nm}</b> — PMS სერვისი არ პასუხობს\n"
+                            f"📍 IP: {self.ip}:{self.port}\n"
+                            f"⚠️ სტატუსის API მიუწვდომელია (სერვისი გაჩერდა ან ავტორიზაცია ვერ ხერხდება)")})
+            alert_mgr.update_state(self.ip, True)
+            return alerts
+        alert_mgr.clear(f"{uid}_pmsapi")
+
+        # 1) night audit overdue (> 26h)
+        hrs = data.get('hours_since_night_audit')
+        if hrs is not None and hrs > 26:
+            alerts.append({'key': f"{uid}_nightaudit", 'severity': 'critical', 'category': 'night_audit',
+                'message': (f"🌙 <b>{nm}</b> — ღამის აუდიტი არ ჩატარებულა!\n"
+                            f"📍 IP: {self.ip}\n"
+                            f"⏱️ ბოლო აუდიტიდან გავიდა {hrs:.0f} საათი\n"
+                            f"⚠️ დღის დახურვა ვერ მოხერხდა — შემოსავალი და ოთახები არ დაიდასტურა")})
+        else:
+            alert_mgr.clear(f"{uid}_nightaudit")
+
+        # 2) backup missing / failed (not ok, or older than 26h)
+        b_at, b_ok = data.get('last_backup_at'), data.get('last_backup_ok')
+        b_age = _hours_since(b_at)
+        if b_ok is False or b_at is None or (b_age is not None and b_age > 26):
+            reason = ('ბოლო ბექაფი ჩავარდა' if b_ok is False
+                      else ('ბექაფი არასდროს გაკეთებულა' if b_at is None
+                            else f'ბოლო ბექაფიდან გავიდა {b_age:.0f} საათი'))
+            alerts.append({'key': f"{uid}_backup", 'severity': 'critical', 'category': 'backup',
+                'message': (f"💾 <b>{nm}</b> — ბაზის ბექაფის პრობლემა!\n"
+                            f"📍 IP: {self.ip}\n⚠️ {reason}")})
+        else:
+            alert_mgr.clear(f"{uid}_backup")
+
+        # 3) DB integrity failed
+        if data.get('integrity_ok') is False:
+            alerts.append({'key': f"{uid}_integrity", 'severity': 'critical', 'category': 'backup',
+                'message': (f"🧩 <b>{nm}</b> — ბაზის მთლიანობა დაზიანებულია!\n"
+                            f"📍 IP: {self.ip}\n⚠️ integrity_check ვერ გაიარა — საჭიროა დაუყოვნებელი ჩარევა")})
+        else:
+            alert_mgr.clear(f"{uid}_integrity")
+
+        # 4) disk space (critical < 500MB, warning < 2GB)
+        free = data.get('disk_free_bytes')
+        if free is not None and free < 500 * 1024 * 1024:
+            alerts.append({'key': f"{uid}_pmsdisk", 'severity': 'critical', 'category': 'pms_disk',
+                'message': (f"🟥 <b>{nm}</b> — დისკზე ადგილი თითქმის აღარ დარჩა!\n"
+                            f"📍 IP: {self.ip}\n💽 თავისუფალია მხოლოდ {_fmt_bytes(free)}")})
+        elif free is not None and free < 2 * 1024 * 1024 * 1024:
+            alerts.append({'key': f"{uid}_pmsdisk", 'severity': 'warning', 'category': 'pms_disk',
+                'message': (f"🟨 <b>{nm}</b> — დისკზე ადგილი მცირდება\n"
+                            f"📍 IP: {self.ip}\n💽 თავისუფალია {_fmt_bytes(free)}")})
+        else:
+            alert_mgr.clear(f"{uid}_pmsdisk")
+
+        # 5) licence expiry (critical expired, warning < 10 days)
+        dl = data.get('license_days_left')
+        if dl is not None and dl < 0:
+            alerts.append({'key': f"{uid}_license", 'severity': 'critical', 'category': 'license',
+                'message': (f"📅 <b>{nm}</b> — ლიცენზია ვადაგასულია!\n"
+                            f"📍 IP: {self.ip}\n⚠️ ვადა გავიდა {abs(dl)} დღის წინ")})
+        elif dl is not None and dl < 10:
+            alerts.append({'key': f"{uid}_license", 'severity': 'warning', 'category': 'license',
+                'message': (f"📅 <b>{nm}</b> — ლიცენზიის ვადა იწურება\n"
+                            f"📍 IP: {self.ip}\n⏳ დარჩა {dl} დღე")})
+        else:
+            alert_mgr.clear(f"{uid}_license")
+
+        # 6) encoder missing while a real lock driver is configured
+        if data.get('encoder_present') is False and (data.get('lock_driver') or 'manual') != 'manual':
+            alerts.append({'key': f"{uid}_encoder", 'severity': 'warning', 'category': 'pms_error',
+                'message': (f"🔑 <b>{nm}</b> — ბარათის ენკოდერი არ არის მიერთებული\n"
+                            f"📍 IP: {self.ip}\n⚠️ დრაივერი: {data.get('lock_driver')} — ბარათების დაწერა ვერ მოხერხდება")})
+        else:
+            alert_mgr.clear(f"{uid}_encoder")
+
+        # 7) aggregated critical application errors (one alert, with counts)
+        errs = data.get('errors') or []
+        crit = [e for e in errs if e.get('severity') == 'critical']
+        if crit:
+            total = sum(int(e.get('count', 1)) for e in crit)
+            routes = ', '.join(sorted({e.get('route') or '?' for e in crit}))[:120]
+            alerts.append({'key': f"{uid}_pmserror", 'severity': 'warning', 'category': 'pms_error',
+                'message': (f"🐞 <b>{nm}</b> — პროგრამის კრიტიკული შეცდომები\n"
+                            f"📍 IP: {self.ip}\n"
+                            f"⚠️ {len(crit)} სახის შეცდომა, სულ {total} შემთხვევა\n"
+                            f"📄 {routes}")})
+        else:
+            alert_mgr.clear(f"{uid}_pmserror")
+
+        # 8) version drift vs the configured fleet target (info)
+        tgt = self.fleet_target_version
+        ver = data.get('app_version')
+        if tgt and ver and ver != tgt:
+            alerts.append({'key': f"{uid}_version", 'severity': 'info', 'category': 'pms_error',
+                'message': (f"ℹ️ <b>{nm}</b> — ვერსია ფლიტის სამიზნეს არ ემთხვევა\n"
+                            f"📍 IP: {self.ip}\n📦 {ver} → სამიზნე {tgt}")})
+        else:
+            alert_mgr.clear(f"{uid}_version")
+
+        alert_mgr.update_state(self.ip, True)
+        return alerts
+
+
+# ============================================================
 # FACTORY
 # ============================================================
 DEVICE_TYPES = {
@@ -1371,6 +1562,8 @@ DEVICE_TYPES = {
     'ups': UPSDevice,
     # Monitoring
     'http_device': HTTPDevice,
+    # Haven PMS (our hotel property-management system)
+    'haven_pms': HavenPMS,
     # Generic
     'ip_camera': NetworkDevice,
     'printer': SNMPDevice,

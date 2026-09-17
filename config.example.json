@@ -26,7 +26,12 @@
         "hdd": true,
         "camera": true,
         "recording": true,
-        "clock": true
+        "clock": true,
+        "night_audit": true,
+        "backup": true,
+        "pms_error": true,
+        "license": true,
+        "pms_disk": true
       },
       "devices": [
         {
@@ -36,6 +41,16 @@
           "port": 80,
           "username": "admin",
           "password": "CHANGE_ME"
+        },
+        {
+          "name": "Reception PMS",
+          "type": "haven_pms",
+          "ip": "10.7.0.2",
+          "port": 8770,
+          "username": "netwatch",
+          "password": "CHANGE_ME",
+          "site_id": "site-a",
+          "fleet_target_version": "0.1.0"
         },
         {
           "name": "Gateway Router",

@@ -76,6 +76,12 @@ NOTIFICATION_CATEGORIES = [
     ('port',         'Switch port up / down',     ['network']),
     ('ups',          'UPS battery low',           ['network']),
     ('http',         'HTTP service errors',       ['network']),
+    # Haven PMS
+    ('night_audit',  'PMS night audit overdue',   ['haven']),
+    ('backup',       'PMS backup / DB integrity', ['haven']),
+    ('pms_error',    'PMS app errors / service',  ['haven']),
+    ('license',      'PMS licence expiry',        ['haven']),
+    ('pms_disk',     'PMS disk space low',        ['haven']),
 ]
 
 _CATEGORY_PATTERNS = [
@@ -91,6 +97,12 @@ _CATEGORY_PATTERNS = [
     ('ups', ('_battery', '_ups')),
     ('port', ('_port',)),
     ('http', ('_http',)),
+    # Haven PMS (alerts also carry an explicit 'category'; these are a fallback)
+    ('night_audit', ('_nightaudit',)),
+    ('backup', ('_backup', '_integrity')),
+    ('pms_disk', ('_pmsdisk',)),
+    ('license', ('_license',)),
+    ('pms_error', ('_pmserror', '_encoder', '_version', '_pmsapi')),
     ('offline', ('_offline', '_recovery')),
 ]
 
